@@ -1,0 +1,173 @@
+name: CI - Build, Test and Publish
+
+# Ejecución automática ante push directo o Pull Request hacia la rama principal.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Permisos mínimos necesarios: lectura del código y escritura para publicar en GHCR.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Fase 1: análisis estático de código Python (Ruff) y buenas prácticas en Dockerfiles (Hadolint).
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Python code with Ruff
+        uses: astral-sh/ruff-action@v1
+
+      - name: Lint catalog_service Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: catalog_service/Dockerfile
+
+      - name: Lint tracker_service Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: tracker_service/Dockerfile
+
+  # Fase 2: pruebas unitarias aisladas de lógica de negocio (sin dependencias externas).
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests - catalog_service
+        working-directory: catalog_service
+        run: |
+          pip install -r requirements-dev.txt
+          PYTHONPATH=. pytest tests/unit
+
+      - name: Unit tests - tracker_service
+        working-directory: tracker_service
+        run: |
+          pip install -r requirements-dev.txt
+          PYTHONPATH=. pytest tests/unit
+
+  # Fase 3: pruebas de integración contra servicios reales (PostgreSQL, Redis y SeaweedFS S3).
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U testuser -d testdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub Actions no soporta la clave 'command:' dentro de 'services:'.
+      # Se lanza SeaweedFS con docker run para pasar los flags S3 e -ip.bind=0.0.0.0.
+      - name: Start SeaweedFS (S3-compatible storage)
+        run: |
+          docker run -d --name seaweedfs \
+            -p 9000:9000 \
+            chrislusf/seaweedfs:latest \
+            server -dir=/data -ip.bind=0.0.0.0 -filer -s3 -s3.port=9000
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:9000/ >/dev/null; then
+              echo "SeaweedFS S3 listo"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Error: SeaweedFS S3 no respondió a tiempo"
+          docker logs seaweedfs
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Integration tests - catalog_service
+        working-directory: catalog_service
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/testdb
+          MINIO_ENDPOINT: localhost:9000
+          MINIO_PUBLIC_URL: http://localhost:9000
+          MINIO_ACCESS_KEY: testminio
+          MINIO_SECRET_KEY: testminiopassword
+          MINIO_BUCKET: vaporshelf-test
+        run: |
+          pip install -r requirements-dev.txt
+          PYTHONPATH=. pytest tests/integration
+
+      - name: Integration tests - tracker_service
+        working-directory: tracker_service
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+        run: |
+          pip install -r requirements-dev.txt
+          PYTHONPATH=. pytest tests/integration
+
+  # Fase 4: publicación en GHCR solo al fusionar/hacer push en main (nunca desde PRs).
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR exige que el nombre del propietario del repositorio esté completamente en minúsculas.
+      - name: Normalize repository owner to lowercase
+        id: repo
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Etiquetado inmutable con el SHA del commit junto con 'latest' para trazabilidad.
+      - name: Build and push catalog_service
+        uses: docker/build-push-action@v6
+        with:
+          context: ./catalog_service
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/vaporshelf-catalog:${{ github.sha }}
+            ghcr.io/${{ steps.repo.outputs.owner }}/vaporshelf-catalog:latest
+
+      - name: Build and push tracker_service
+        uses: docker/build-push-action@v6
+        with:
+          context: ./tracker_service
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/vaporshelf-tracker:${{ github.sha }}
+            ghcr.io/${{ steps.repo.outputs.owner }}/vaporshelf-tracker:latest
