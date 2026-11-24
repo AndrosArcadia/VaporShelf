@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Persistencia de metadatos relacionales ante reinicios de contenedores.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - vaporshelf_net
+    # Evita que catalog_service intente conectarse antes de que Postgres acepte conexiones.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    # Persistencia AOF (--appendonly yes) para no perder el progreso de lectura al reiniciar.
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - vaporshelf_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    # SeaweedFS como almacenamiento de objetos compatible con la API S3.
+    image: chrislusf/seaweedfs:latest
+    # -ip.bind=0.0.0.0 fuerza la escucha en todas las interfaces (evita fallos en localhost).
+    command: server -dir=/data -ip.bind=0.0.0.0 -filer -s3 -s3.port=9000
+    ports:
+      - "9000:9000"  # Endpoint API S3
+      - "8888:8888"  # Interfaz web del Filer para inspeccionar buckets/archivos
+    volumes:
+      - minio_data:/data
+    networks:
+      - vaporshelf_net
+    # Se verifica explícitamente 127.0.0.1 para evitar problemas de resolución IPv6 con localhost.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || curl -s http://127.0.0.1:9000/ >/dev/null 2>&1 || wget -qO /dev/null http://127.0.0.1:9000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  catalog_service:
+    build: ./catalog_service
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # MINIO_ENDPOINT resuelve por DNS interno; MINIO_PUBLIC_URL se usa para URLs firmadas desde el host.
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_URL: http://localhost:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - vaporshelf_net
+
+  tracker_service:
+    build: ./tracker_service
+    ports:
+      - "8001:8001"
+    environment:
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - vaporshelf_net
+
+# Red interna aislada: solo se exponen al host las APIs y S3, nunca Postgres ni Redis.
+networks:
+  vaporshelf_net:
+    driver: bridge
+
+# Volúmenes gestionados para garantizar durabilidad tras ejecutar 'docker compose down'.
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
